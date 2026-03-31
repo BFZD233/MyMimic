@@ -55,6 +55,29 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
+# Backward-compatible override rewrite:
+# The Hydra root config is {"env": ..., "agent": ...}, so env overrides should be under "env.*".
+# We transparently map shorthand "obs_pipeline.*" to "env.obs_pipeline.*".
+def _rewrite_obs_pipeline_overrides(overrides: list[str]) -> list[str]:
+    rewritten: list[str] = []
+    for token in overrides:
+        prefix = ""
+        body = token
+        # Preserve Hydra prefix operators (e.g. +, ++, ~).
+        while body.startswith("+"):
+            prefix += "+"
+            body = body[1:]
+        if body.startswith("~"):
+            prefix += "~"
+            body = body[1:]
+
+        if body.startswith("obs_pipeline") and not body.startswith("env.obs_pipeline"):
+            body = "env." + body
+        rewritten.append(prefix + body)
+    return rewritten
+
+hydra_args = _rewrite_obs_pipeline_overrides(hydra_args)
+
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True

@@ -22,6 +22,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import whole_body_tracking.tasks.tracking.mdp as mdp
+from whole_body_tracking.tasks.tracking.obs_pipeline import ObsPipelineCfg, apply_observation_pipeline
 
 ##
 # Scene definition
@@ -127,6 +128,11 @@ class ObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
         actions = ObsTerm(func=mdp.last_action)
+
+        # Extension slots used by non-legacy observation builders.
+        twist2_motion: ObsTerm | None = None
+        twist2_proprio: ObsTerm | None = None
+        twist2_future: ObsTerm | None = None
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -298,6 +304,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
     scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
+    obs_pipeline: ObsPipelineCfg = ObsPipelineCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
     # MDP settings
@@ -320,3 +327,5 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.eye = (1.5, 1.5, 1.5)
         self.viewer.origin_type = "asset_root"
         self.viewer.asset_name = "robot"
+        # Apply mode-driven observation composition after core env defaults are set.
+        apply_observation_pipeline(self)
