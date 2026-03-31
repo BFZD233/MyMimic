@@ -3,6 +3,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib.metadata as metadata
 import sys
 
 from isaaclab.app import AppLauncher
@@ -53,7 +54,8 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab.utils.io import load_yaml
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -62,15 +64,58 @@ import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
+def resolve_cli_motion_file() -> str | None:
+    if args_cli.motion_file is None:
+        return None
+    motion_path = pathlib.Path(args_cli.motion_file).expanduser().resolve()
+    if not motion_path.is_file():
+        raise FileNotFoundError(f"--motion_file does not exist: {motion_path}")
+    print(f"[INFO] Using motion file from CLI: {motion_path}")
+    return str(motion_path)
+
+
+def resolve_motion_file_from_saved_env_cfg(resume_path: str) -> str | None:
+    env_yaml_path = pathlib.Path(resume_path).resolve().parent / "params" / "env.yaml"
+    if not env_yaml_path.is_file():
+        return None
+
+    env_yaml = load_yaml(str(env_yaml_path))
+    motion_file = (
+        env_yaml.get("commands", {})
+        .get("motion", {})
+        .get("motion_file", None)
+    )
+    if not isinstance(motion_file, str) or not motion_file:
+        return None
+    motion_path = pathlib.Path(motion_file).expanduser().resolve()
+    if motion_path.is_file():
+        print(f"[INFO] Using motion file from saved run config: {motion_path}")
+        return str(motion_path)
+    return None
+
+
+def resolve_default_motion_file(env_cfg) -> str | None:
+    motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
+    motion_file = getattr(motion_cfg, "motion_file", None)
+    if isinstance(motion_file, str) and motion_file and pathlib.Path(motion_file).is_file():
+        motion_path = pathlib.Path(motion_file).expanduser().resolve()
+        print(f"[INFO] Using motion file from task default config: {motion_path}")
+        return str(motion_path)
+    return None
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    installed_version = metadata.version("rsl-rl-lib")
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
+    artifact_motion_file = None
 
     if args_cli.wandb_path:
         import wandb
@@ -95,20 +140,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         resume_path = f"./logs/rsl_rl/temp/{file}"
 
-        if args_cli.motion_file is not None:
-            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
-
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
             print("[WARN] No model artifact found in the run.")
         else:
-            env_cfg.commands.motion.motion_file = str(pathlib.Path(art.download()) / "motion.npz")
+            artifact_motion_file = str(pathlib.Path(art.download()) / "motion.npz")
 
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+    # motion source priority:
+    # 1) --motion_file
+    # 2) wandb artifact motion (if wandb_path is used)
+    # 3) saved run config at <run>/params/env.yaml
+    # 4) task default motion_file
+    motion_file = resolve_cli_motion_file()
+    if motion_file is None and artifact_motion_file is not None:
+        motion_file = artifact_motion_file
+        print(f"[INFO] Using motion file from wandb artifact: {motion_file}")
+    if motion_file is None:
+        motion_file = resolve_motion_file_from_saved_env_cfg(resume_path)
+    if motion_file is None:
+        motion_file = resolve_default_motion_file(env_cfg)
+    if motion_file is None:
+        raise ValueError(
+            "Could not resolve motion file. Please pass --motion_file /path/to/motion.npz "
+            "or use --wandb_path with a run that has a motions artifact."
+        )
+    env_cfg.commands.motion.motion_file = motion_file
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -132,7 +193,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = multi_agent_to_single_agent(env)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -144,10 +205,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
+    policy_for_export = ppo_runner.alg.get_policy() if hasattr(ppo_runner.alg, "get_policy") else ppo_runner.alg.policy
     export_motion_policy_as_onnx(
         env.unwrapped,
-        ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
+        policy_for_export,
+        normalizer=getattr(ppo_runner, "obs_normalizer", None),
         path=export_model_dir,
         filename="policy.onnx",
     )

@@ -28,6 +28,63 @@ def export_motion_policy_as_onnx(
     policy_exporter.export(path, filename)
 
 
+def export_obs_policy_as_onnx(
+    actor_critic: object,
+    path: str,
+    normalizer: object | None = None,
+    filename="policy.onnx",
+    verbose=False,
+):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+    policy_exporter = _OnnxObsPolicyExporter(actor_critic, normalizer, verbose)
+    policy_exporter.export(path, filename)
+
+
+class _OnnxObsPolicyExporter(_OnnxPolicyExporter):
+    def __init__(self, actor_critic, normalizer=None, verbose=False):
+        # rsl-rl <= 4.x: actor_critic has `.actor` and is supported by parent exporter.
+        # rsl-rl >= 5.x: policy is model-like (e.g., MLPModel) and exposes `.as_onnx(...)`.
+        if hasattr(actor_critic, "actor") or hasattr(actor_critic, "student"):
+            super().__init__(actor_critic, normalizer, verbose)
+        elif hasattr(actor_critic, "as_onnx"):
+            torch.nn.Module.__init__(self)
+            self.verbose = verbose
+            self.is_recurrent = getattr(actor_critic, "is_recurrent", False)
+            if self.is_recurrent:
+                raise NotImplementedError("Recurrent policy export is not supported in obs-only exporter.")
+            self.actor = actor_critic.as_onnx(verbose=verbose)
+            self.normalizer = torch.nn.Identity()
+        else:
+            raise ValueError("Unsupported policy object for ONNX obs-only export.")
+
+    def forward(self, x):
+        return self.actor(self.normalizer(x))
+
+    def export(self, path, filename):
+        self.to("cpu")
+        if hasattr(self.actor, "input_size"):
+            obs_dim = self.actor.input_size
+        elif isinstance(self.actor, torch.nn.Sequential):
+            obs_dim = self.actor[0].in_features
+        elif hasattr(self.actor, "__getitem__"):
+            obs_dim = self.actor[0].in_features
+        else:
+            raise ValueError("Unable to infer observation dimension for ONNX obs-only export.")
+        obs = torch.zeros(1, obs_dim)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=11,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )
+
+
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
         # rsl-rl <= 4.x: actor_critic has `.actor` and is supported by parent exporter.
