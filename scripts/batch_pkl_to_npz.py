@@ -14,6 +14,14 @@ Example:
         --input_glob '*/*.pkl' \
         --output_fps 50 \
         --headless
+
+    # Or consume a motion-library yaml:
+    python scripts/batch_pkl_to_npz.py \
+        --input_yaml config/twist2_dataset_debug.yaml \
+        --output_root /media/raid/workspace/huangyuming/TWIST2/TWIST2_full_npz \
+        --output_fps 50 \
+        --cuda_visible_devices 6 \
+        --headless
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -22,8 +30,10 @@ import argparse
 import os
 import pickle
 import sys
+import threading
 import traceback
 import types
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +81,15 @@ parser.add_argument(
     help="Glob pattern relative to input_root used to discover motion files.",
 )
 parser.add_argument(
+    "--input_yaml",
+    type=str,
+    default=None,
+    help=(
+        "Optional motion library yaml. If set, conversion sources are resolved from yaml['motions'][*]['file'] "
+        "relative to yaml['root_path'] (or root_dir/root)."
+    ),
+)
+parser.add_argument(
     "--output_fps",
     type=int,
     default=50,
@@ -116,6 +135,17 @@ parser.add_argument(
         "before launching Isaac Sim. This remaps runtime device index to cuda:0."
     ),
 )
+parser.add_argument(
+    "--cuda_visible_devices",
+    type=str,
+    default=None,
+    help=(
+        "Optional explicit CUDA_VISIBLE_DEVICES value (for example: '6' or '6,7'). "
+        "Applied before Isaac Sim launch. If a single visible GPU is provided, runtime device is remapped to cuda:0."
+    ),
+)
+# Backward-compatible typo alias used in some local scripts.
+parser.add_argument("--cuda_visibile_devices", dest="cuda_visible_devices", type=str, help=argparse.SUPPRESS)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -167,10 +197,94 @@ def parse_cuda_device_index(device: str) -> int | None:
     return int(device.split(":")[-1])
 
 
+def _resolve_yaml_root_prelaunch(yaml_path: Path, payload: dict) -> Path:
+    root_value = payload.get("root_path", None)
+    if root_value is None:
+        root_value = payload.get("root_dir", None)
+    if root_value is None:
+        root_value = payload.get("root", None)
+    if root_value is None:
+        return yaml_path.parent.resolve()
+    root_path = Path(str(root_value)).expanduser()
+    if not root_path.is_absolute():
+        root_path = (yaml_path.parent / root_path).resolve()
+    else:
+        root_path = root_path.resolve()
+    return root_path
+
+
+def _collect_prelaunch_items(input_root: Path, output_root: Path) -> list[tuple[Path, Path]]:
+    items: list[tuple[Path, Path]] = []
+    if args_cli.input_yaml is not None:
+        try:
+            import yaml
+        except ImportError as error:
+            raise ImportError("PyYAML is required for --input_yaml. Please install `pyyaml`.") from error
+        input_yaml = Path(args_cli.input_yaml).expanduser().resolve()
+        if not input_yaml.is_file():
+            raise FileNotFoundError(f"Input yaml does not exist: {input_yaml}")
+        with input_yaml.open("r", encoding="utf-8") as file:
+            payload = yaml.safe_load(file)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected mapping yaml in {input_yaml}, got {type(payload)!r}")
+        motions = payload.get("motions", None)
+        if not isinstance(motions, list):
+            raise ValueError(f"'motions' in {input_yaml} must be a list")
+        yaml_root = _resolve_yaml_root_prelaunch(input_yaml, payload)
+        for index, motion_item in enumerate(motions):
+            if isinstance(motion_item, str):
+                raw_file = motion_item
+            elif isinstance(motion_item, dict):
+                raw_file = motion_item.get("file", None)
+            else:
+                raise TypeError(f"motions[{index}] in {input_yaml} must be a string or mapping")
+            if raw_file is None:
+                raise KeyError(f"Missing file in motions[{index}] of {input_yaml}")
+            source_file = Path(str(raw_file)).expanduser()
+            if source_file.is_absolute():
+                src = source_file.resolve()
+                if src.is_relative_to(yaml_root):
+                    rel = src.relative_to(yaml_root)
+                else:
+                    rel = Path(src.name)
+            else:
+                rel = source_file
+                src = (yaml_root / rel).resolve()
+            dst = output_root / rel.with_suffix(".npz")
+            items.append((src, dst))
+    else:
+        if not input_root.is_dir():
+            raise NotADirectoryError(f"Input root does not exist: {input_root}")
+        for src in sorted(path for path in input_root.glob(args_cli.input_glob) if path.is_file()):
+            rel = src.relative_to(input_root)
+            dst = output_root / rel.with_suffix(".npz")
+            items.append((src, dst))
+    return items
+
+
 selected_device_original = str(getattr(args_cli, "device", "cuda:0"))
 selected_device = selected_device_original
 selected_device_id: int | None = None
 selected_device_id = parse_cuda_device_index(selected_device)
+skip_explicit_gpu_binding = False
+
+if args_cli.cuda_visible_devices and args_cli.isolate_visible_gpus:
+    raise ValueError("--cuda_visible_devices and --isolate_visible_gpus are mutually exclusive. Please use only one.")
+
+if args_cli.cuda_visible_devices is not None:
+    visible = args_cli.cuda_visible_devices.strip()
+    if not visible:
+        raise ValueError("--cuda_visible_devices was provided but empty.")
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    visible_ids = [token.strip() for token in visible.split(",") if token.strip()]
+    if len(visible_ids) == 1 and selected_device.startswith("cuda"):
+        selected_device = "cuda:0"
+        args_cli.device = selected_device
+        selected_device_id = 0
+    elif len(visible_ids) > 1:
+        # Device ordinal semantics become relative to visible list.
+        # Skip forcing /renderer/activeGpu to avoid binding to an invalid physical index.
+        skip_explicit_gpu_binding = True
 
 if args_cli.isolate_visible_gpus:
     if selected_device_id is None:
@@ -189,7 +303,7 @@ if selected_device.startswith("cuda") and not args_cli.allow_multi_gpu:
     existing_kit_args = getattr(args_cli, "kit_args", None)
     if not existing_kit_args or "--/renderer/multiGpu/" not in existing_kit_args:
         args_cli.kit_args = append_kit_args(existing_kit_args, single_gpu_kit_args)
-if selected_device_id is not None:
+if selected_device_id is not None and not skip_explicit_gpu_binding:
     existing_kit_args = getattr(args_cli, "kit_args", None)
     explicit_gpu_binding_kit_args = (
         f"--/renderer/activeGpu={selected_device_id} "
@@ -214,6 +328,37 @@ write_config_line("effective_kit_args", str(getattr(args_cli, "kit_args", "")))
 write_config_line("cuda_visible_devices", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
 write_config_line("ld_library_path", os.environ.get("LD_LIBRARY_PATH", ""))
 write_config_line("vk_icd_filenames", os.environ.get("VK_ICD_FILENAMES", ""))
+
+precheck_input_root = Path(args_cli.input_root).expanduser().resolve()
+precheck_output_root = Path(args_cli.output_root).expanduser().resolve()
+precheck_items = _collect_prelaunch_items(precheck_input_root, precheck_output_root)
+if args_cli.max_files is not None:
+    precheck_items = precheck_items[: args_cli.max_files]
+precheck_pending = [(src, dst) for (src, dst) in precheck_items if args_cli.force or (not dst.exists())]
+write_config_line("precheck_total_items", str(len(precheck_items)))
+write_config_line("precheck_pending_items", str(len(precheck_pending)))
+if len(precheck_items) > 0 and len(precheck_pending) == 0:
+    emit(
+        "[INFO] Pre-check: all target npz files already exist and --force is not set. "
+        "No conversion needed; exiting without launching Isaac Sim."
+    )
+    append_text(
+        RUN_SUMMARY_PATH,
+        "\n".join(
+            [
+                f"run_dir={RUN_DIR}",
+                f"input_root={precheck_input_root}",
+                f"output_root={precheck_output_root}",
+                f"total={len(precheck_items)}",
+                "converted=0",
+                f"skipped={len(precheck_items)}",
+                "failed=0",
+                "note=precheck_no_pending_exit",
+            ]
+        )
+        + "\n",
+    )
+    sys.exit(0)
 
 if os.environ.get("CUDA_VISIBLE_DEVICES"):
     if args_cli.isolate_visible_gpus:
@@ -253,7 +398,7 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, quat_slerp
+from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul
 
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
 
@@ -291,6 +436,14 @@ G1_JOINT_NAMES = [
 ]
 
 REQUIRED_KEYS = {"fps", "root_pos", "root_rot", "dof_pos"}
+
+
+@dataclass(frozen=True)
+class MotionConversionItem:
+    """Source and relative path descriptor for a single conversion task."""
+
+    input_path: Path
+    relative_path: Path
 
 
 def install_numpy_pickle_compat() -> None:
@@ -423,10 +576,32 @@ class PklMotionLoader:
         return a * (1.0 - blend) + b * blend
 
     def _slerp(self, a: torch.Tensor, b: torch.Tensor, blend: torch.Tensor) -> torch.Tensor:
-        slerped_quats = torch.zeros_like(a)
-        for index in range(a.shape[0]):
-            slerped_quats[index] = quat_slerp(a[index], b[index], blend[index])
-        return slerped_quats
+        # Fast batched slerp path for a sequence of quaternions.
+        # Inputs: a/b=(T, 4), blend=(T,).
+        a = torch.nn.functional.normalize(a, p=2, dim=1)
+        b = torch.nn.functional.normalize(b, p=2, dim=1)
+
+        dot = torch.sum(a * b, dim=1)
+        neg_mask = dot < 0.0
+        b = torch.where(neg_mask.unsqueeze(1), -b, b)
+        dot = torch.where(neg_mask, -dot, dot)
+        dot = torch.clamp(dot, -1.0, 1.0)
+
+        linear_mask = dot > 0.9995
+        linear = a + blend.unsqueeze(1) * (b - a)
+        linear = torch.nn.functional.normalize(linear, p=2, dim=1)
+
+        theta_0 = torch.acos(dot)
+        sin_theta_0 = torch.sin(theta_0)
+        theta = theta_0 * blend
+        sin_theta = torch.sin(theta)
+        denom = torch.clamp(sin_theta_0, min=1e-8)
+        s0 = torch.sin(theta_0 - theta) / denom
+        s1 = sin_theta / denom
+        spherical = s0.unsqueeze(1) * a + s1.unsqueeze(1) * b
+        spherical = torch.nn.functional.normalize(spherical, p=2, dim=1)
+
+        return torch.where(linear_mask.unsqueeze(1), linear, spherical)
 
     def _compute_velocities(self) -> None:
         self.motion_base_lin_vels = torch.gradient(self.motion_base_poss, spacing=self.output_dt, dim=0)[0]
@@ -450,6 +625,82 @@ class PklMotionLoader:
 
 def discover_input_files(input_root: Path, pattern: str) -> list[Path]:
     return sorted(path for path in input_root.glob(pattern) if path.is_file())
+
+
+def _resolve_yaml_root(yaml_path: Path, payload: dict) -> Path:
+    root_value = payload.get("root_path", None)
+    if root_value is None:
+        root_value = payload.get("root_dir", None)
+    if root_value is None:
+        root_value = payload.get("root", None)
+    if root_value is None:
+        return yaml_path.parent.resolve()
+
+    root_path = Path(str(root_value)).expanduser()
+    if not root_path.is_absolute():
+        root_path = (yaml_path.parent / root_path).resolve()
+    else:
+        root_path = root_path.resolve()
+    return root_path
+
+
+def load_conversion_items_from_yaml(yaml_path: Path) -> tuple[Path, list[MotionConversionItem]]:
+    try:
+        import yaml
+    except ImportError as error:
+        raise ImportError("PyYAML is required for --input_yaml. Please install `pyyaml`.") from error
+
+    with yaml_path.open("r", encoding="utf-8") as file:
+        payload = yaml.safe_load(file)
+
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected mapping yaml in {yaml_path}, got {type(payload)!r}")
+    if "motions" not in payload:
+        raise KeyError(f"Missing 'motions' key in {yaml_path}")
+    motions = payload["motions"]
+    if not isinstance(motions, list) or len(motions) == 0:
+        raise ValueError(f"'motions' in {yaml_path} must be a non-empty list")
+
+    yaml_root = _resolve_yaml_root(yaml_path, payload)
+    items: list[MotionConversionItem] = []
+    for index, motion_item in enumerate(motions):
+        if isinstance(motion_item, str):
+            raw_file = motion_item
+        elif isinstance(motion_item, dict):
+            raw_file = motion_item.get("file", None)
+            if raw_file is None:
+                raise KeyError(f"Missing 'file' in motions[{index}] of {yaml_path}")
+        else:
+            raise TypeError(f"motions[{index}] in {yaml_path} must be a string or mapping, got {type(motion_item)!r}")
+
+        source_file = Path(str(raw_file)).expanduser()
+        if source_file.is_absolute():
+            input_path = source_file.resolve()
+            if not input_path.is_relative_to(yaml_root):
+                raise ValueError(
+                    f"motions[{index}]={input_path} is outside yaml root {yaml_root}. "
+                    "Please use files under root_path/root_dir/root for stable relative-path mirroring."
+                )
+            relative_path = input_path.relative_to(yaml_root)
+        else:
+            relative_path = source_file
+            input_path = (yaml_root / source_file).resolve()
+
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"motions[{index}] has invalid relative path {relative_path}. "
+                "Please use a normalized relative path under root_path."
+            )
+
+        if input_path.suffix.lower() not in {".pkl", ".pickle"}:
+            raise ValueError(
+                f"motions[{index}]={input_path} is not a .pkl/.pickle file. "
+                "This converter expects pickle motions as input."
+            )
+
+        items.append(MotionConversionItem(input_path=input_path, relative_path=relative_path.with_suffix(".npz")))
+
+    return yaml_root, items
 
 
 def resolve_robot_urdf_path(explicit_urdf: str | None, default_urdf: str) -> Path:
@@ -500,8 +751,7 @@ def resolve_robot_urdf_path(explicit_urdf: str | None, default_urdf: str) -> Pat
     )
 
 
-def build_output_path(input_root: Path, output_root: Path, input_path: Path) -> Path:
-    relative_path = input_path.relative_to(input_root)
+def build_output_path(output_root: Path, relative_path: Path) -> Path:
     return output_root / relative_path.with_suffix(".npz")
 
 
@@ -523,66 +773,90 @@ def convert_motion_file(
 ) -> None:
     motion = PklMotionLoader(input_path, output_fps=args_cli.output_fps, device=sim.device)
 
-    log: dict[str, list[np.ndarray] | np.ndarray] = {
+    num_frames = motion.output_frames
+    joint_dim = int(robot.data.joint_pos.shape[1])
+    body_dim = int(robot.data.body_pos_w.shape[1])
+
+    joint_pos_log = torch.empty((num_frames, joint_dim), device=sim.device, dtype=robot.data.joint_pos.dtype)
+    joint_vel_log = torch.empty((num_frames, joint_dim), device=sim.device, dtype=robot.data.joint_vel.dtype)
+    body_pos_log = torch.empty((num_frames, body_dim, 3), device=sim.device, dtype=robot.data.body_pos_w.dtype)
+    body_quat_log = torch.empty((num_frames, body_dim, 4), device=sim.device, dtype=robot.data.body_quat_w.dtype)
+    body_lin_vel_log = torch.empty((num_frames, body_dim, 3), device=sim.device, dtype=robot.data.body_lin_vel_w.dtype)
+    body_ang_vel_log = torch.empty((num_frames, body_dim, 3), device=sim.device, dtype=robot.data.body_ang_vel_w.dtype)
+
+    default_root_state = robot.data.default_root_state.clone()
+    default_joint_pos = robot.data.default_joint_pos.clone()
+    default_joint_vel = robot.data.default_joint_vel.clone()
+    root_states = default_root_state.clone()
+    joint_pos = default_joint_pos.clone()
+    joint_vel = default_joint_vel.clone()
+
+    with torch.inference_mode():
+        for frame_index in range(num_frames):
+            root_states.copy_(default_root_state)
+            joint_pos.copy_(default_joint_pos)
+            joint_vel.copy_(default_joint_vel)
+
+            root_states[:, :3] = motion.motion_base_poss[frame_index : frame_index + 1]
+            root_states[:, :2] += scene.env_origins[:, :2]
+            root_states[:, 3:7] = motion.motion_base_rots[frame_index : frame_index + 1]
+            root_states[:, 7:10] = motion.motion_base_lin_vels[frame_index : frame_index + 1]
+            root_states[:, 10:] = motion.motion_base_ang_vels[frame_index : frame_index + 1]
+            robot.write_root_state_to_sim(root_states)
+
+            joint_pos[:, robot_joint_indexes] = motion.motion_dof_poss[frame_index : frame_index + 1]
+            joint_vel[:, robot_joint_indexes] = motion.motion_dof_vels[frame_index : frame_index + 1]
+            robot.write_joint_state_to_sim(joint_pos, joint_vel)
+
+            sim.render()
+            scene.update(sim.get_physics_dt())
+
+            joint_pos_log[frame_index].copy_(robot.data.joint_pos[0])
+            joint_vel_log[frame_index].copy_(robot.data.joint_vel[0])
+            body_pos_log[frame_index].copy_(robot.data.body_pos_w[0])
+            body_quat_log[frame_index].copy_(robot.data.body_quat_w[0])
+            body_lin_vel_log[frame_index].copy_(robot.data.body_lin_vel_w[0])
+            body_ang_vel_log[frame_index].copy_(robot.data.body_ang_vel_w[0])
+
+    stacked_log = {
         "fps": np.array([args_cli.output_fps], dtype=np.int32),
-        "joint_pos": [],
-        "joint_vel": [],
-        "body_pos_w": [],
-        "body_quat_w": [],
-        "body_lin_vel_w": [],
-        "body_ang_vel_w": [],
+        "joint_pos": joint_pos_log.cpu().numpy(),
+        "joint_vel": joint_vel_log.cpu().numpy(),
+        "body_pos_w": body_pos_log.cpu().numpy(),
+        "body_quat_w": body_quat_log.cpu().numpy(),
+        "body_lin_vel_w": body_lin_vel_log.cpu().numpy(),
+        "body_ang_vel_w": body_ang_vel_log.cpu().numpy(),
     }
-
-    for frame_index in range(motion.output_frames):
-        motion_base_pos = motion.motion_base_poss[frame_index : frame_index + 1]
-        motion_base_rot = motion.motion_base_rots[frame_index : frame_index + 1]
-        motion_base_lin_vel = motion.motion_base_lin_vels[frame_index : frame_index + 1]
-        motion_base_ang_vel = motion.motion_base_ang_vels[frame_index : frame_index + 1]
-        motion_dof_pos = motion.motion_dof_poss[frame_index : frame_index + 1]
-        motion_dof_vel = motion.motion_dof_vels[frame_index : frame_index + 1]
-
-        root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion_base_pos
-        root_states[:, :2] += scene.env_origins[:, :2]
-        root_states[:, 3:7] = motion_base_rot
-        root_states[:, 7:10] = motion_base_lin_vel
-        root_states[:, 10:] = motion_base_ang_vel
-        robot.write_root_state_to_sim(root_states)
-
-        joint_pos = robot.data.default_joint_pos.clone()
-        joint_vel = robot.data.default_joint_vel.clone()
-        joint_pos[:, robot_joint_indexes] = motion_dof_pos
-        joint_vel[:, robot_joint_indexes] = motion_dof_vel
-        robot.write_joint_state_to_sim(joint_pos, joint_vel)
-
-        sim.render()
-        scene.update(sim.get_physics_dt())
-
-        log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
-        log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
-        log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
-        log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-        log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
-        log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
-
-    stacked_log = {"fps": log["fps"]}
-    for key in ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w"):
-        stacked_log[key] = np.stack(log[key], axis=0)
 
     save_log_npz(output_path, stacked_log, compressed=args_cli.compressed)
 
 
 def main() -> None:
-    input_root = Path(args_cli.input_root).expanduser().resolve()
     output_root = Path(args_cli.output_root).expanduser().resolve()
+    input_root: Path | None = None
+    input_yaml: Path | None = None
 
-    if not input_root.is_dir():
-        raise NotADirectoryError(f"Input root does not exist: {input_root}")
+    conversion_items: list[MotionConversionItem] = []
+    if args_cli.input_yaml is not None:
+        input_yaml = Path(args_cli.input_yaml).expanduser().resolve()
+        if not input_yaml.is_file():
+            raise FileNotFoundError(f"Input yaml does not exist: {input_yaml}")
+        input_root, conversion_items = load_conversion_items_from_yaml(input_yaml)
+    else:
+        input_root = Path(args_cli.input_root).expanduser().resolve()
+        if not input_root.is_dir():
+            raise NotADirectoryError(f"Input root does not exist: {input_root}")
+        input_files = discover_input_files(input_root, args_cli.input_glob)
+        conversion_items = [
+            MotionConversionItem(input_path=path, relative_path=path.relative_to(input_root).with_suffix(".npz"))
+            for path in input_files
+        ]
 
-    input_files = discover_input_files(input_root, args_cli.input_glob)
     if args_cli.max_files is not None:
-        input_files = input_files[: args_cli.max_files]
-    if not input_files:
+        conversion_items = conversion_items[: args_cli.max_files]
+    if not conversion_items:
+        if input_yaml is not None:
+            raise FileNotFoundError(f"No valid pkl files resolved from yaml: {input_yaml}")
         raise FileNotFoundError(f"No pkl files found under {input_root} with pattern {args_cli.input_glob!r}")
 
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
@@ -606,22 +880,46 @@ def main() -> None:
     failed_count = 0
 
     write_config_line("input_root", str(input_root))
+    write_config_line("input_yaml", str(input_yaml) if input_yaml is not None else "")
     write_config_line("output_root", str(output_root))
     write_config_line("input_glob", args_cli.input_glob)
     write_config_line("output_fps", str(args_cli.output_fps))
-    write_config_line("input_files", str(len(input_files)))
+    write_config_line("input_files", str(len(conversion_items)))
 
-    emit(f"[INFO] Found {len(input_files)} input pkl files under {input_root}")
+    if input_yaml is not None:
+        emit(f"[INFO] Found {len(conversion_items)} input pkl files from yaml {input_yaml}")
+    else:
+        emit(f"[INFO] Found {len(conversion_items)} input pkl files under {input_root}")
+    emit("[INFO] Relative paths from motion file entries will be mirrored under output_root.")
     emit(f"[INFO] Writing converted npz files under {output_root}")
 
-    progress = tqdm(input_files, total=len(input_files), desc="Converting motions", unit="file", dynamic_ncols=True)
+    progress = tqdm(
+        conversion_items,
+        total=len(conversion_items),
+        desc="Converting motions",
+        unit="file",
+        dynamic_ncols=True,
+    )
 
-    for file_index, input_path in enumerate(progress, start=1):
-        output_path = build_output_path(input_root, output_root, input_path)
+    for file_index, item in enumerate(progress, start=1):
+        input_path = item.input_path
+        output_path = build_output_path(output_root, item.relative_path)
+        if not input_path.is_file():
+            failed_count += 1
+            emit(
+                f"[ERROR] ({file_index}/{len(conversion_items)}) Missing input file: {input_path}",
+                progress=progress,
+            )
+            record_manifest("failed", input_path, output_path, "input file missing")
+            progress.set_postfix(converted=converted_count, skipped=skipped_count, failed=failed_count)
+            if not args_cli.continue_on_error:
+                raise FileNotFoundError(f"Input file missing: {input_path}")
+            continue
+
         if output_path.exists() and not args_cli.force:
             skipped_count += 1
             emit(
-                f"[SKIP] ({file_index}/{len(input_files)}) {input_path} -> {output_path} already exists",
+                f"[SKIP] ({file_index}/{len(conversion_items)}) {input_path} -> {output_path} already exists",
                 progress=progress,
             )
             record_manifest("skipped", input_path, output_path, "already exists")
@@ -629,7 +927,7 @@ def main() -> None:
             continue
 
         emit(
-            f"[INFO] ({file_index}/{len(input_files)}) Converting {input_path} -> {output_path}",
+            f"[INFO] ({file_index}/{len(conversion_items)}) Converting {input_path} -> {output_path}",
             progress=progress,
         )
         try:
@@ -649,7 +947,7 @@ def main() -> None:
 
     summary_message = (
         "[INFO] Conversion complete: "
-        f"converted={converted_count}, skipped={skipped_count}, failed={failed_count}, total={len(input_files)}"
+        f"converted={converted_count}, skipped={skipped_count}, failed={failed_count}, total={len(conversion_items)}"
     )
     emit(summary_message)
     append_text(
@@ -658,8 +956,9 @@ def main() -> None:
             [
                 f"run_dir={RUN_DIR}",
                 f"input_root={input_root}",
+                f"input_yaml={input_yaml}",
                 f"output_root={output_root}",
-                f"total={len(input_files)}",
+                f"total={len(conversion_items)}",
                 f"converted={converted_count}",
                 f"skipped={skipped_count}",
                 f"failed={failed_count}",
@@ -670,10 +969,34 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
         main()
     except Exception:
         append_text(RUN_LOG_PATH, f"{traceback.format_exc()}\n")
-        raise
+        traceback.print_exc()
+        exit_code = 1
     finally:
-        simulation_app.close()
+        app_obj = globals().get("simulation_app", None)
+        if app_obj is not None:
+            close_done = threading.Event()
+
+            def _close_app_safely() -> None:
+                try:
+                    app_obj.close()
+                finally:
+                    close_done.set()
+
+            close_thread = threading.Thread(target=_close_app_safely, name="isaac_app_close", daemon=True)
+            close_thread.start()
+            close_thread.join(timeout=8.0)
+            if not close_done.is_set():
+                append_text(
+                    RUN_LOG_PATH,
+                    "[WARN] simulation_app.close() timeout after 8s; forcing process exit to avoid hang.\n",
+                )
+                print("[WARN] simulation_app.close() timeout after 8s; forcing process exit to avoid hang.")
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)

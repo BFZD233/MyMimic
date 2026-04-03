@@ -102,6 +102,11 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
         else:
             raise ValueError("Unsupported policy object for ONNX motion export.")
         cmd: MotionCommand = env.command_manager.get_term("motion")
+        if getattr(cmd, "motion", None) is None:
+            raise RuntimeError(
+                "Motion ONNX export requires single-motion timeline (`cmd.motion`), "
+                "but current run is using multi-motion source."
+            )
 
         self.joint_pos = cmd.motion.joint_pos.to("cpu")
         self.joint_vel = cmd.motion.joint_vel.to("cpu")

@@ -133,6 +133,9 @@ class ObservationsCfg:
         twist2_motion: ObsTerm | None = None
         twist2_proprio: ObsTerm | None = None
         twist2_future: ObsTerm | None = None
+        twist2_1432_motion: ObsTerm | None = None
+        twist2_1432_proprio: ObsTerm | None = None
+        twist2_1432_future: ObsTerm | None = None
 
         def __post_init__(self):
             self.enable_corruption = True

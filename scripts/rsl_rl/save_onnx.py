@@ -33,12 +33,22 @@ parser.add_argument(
     default=False,
     help="Export play-style ONNX that only takes `obs` and outputs `actions`.",
 )
+parser.add_argument(
+    "--use_saved_obs_pipeline",
+    action="store_true",
+    default=False,
+    help=(
+        "If set, try to apply obs_pipeline from <ckpt_dir>/params/env.yaml before creating env. "
+        "Keep disabled when checkpoint and saved env config may be out-of-sync."
+    ),
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+raw_hydra_args = list(hydra_args)
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -66,6 +76,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
+from whole_body_tracking.tasks.tracking.obs_pipeline import apply_observation_pipeline
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx, export_obs_policy_as_onnx
 
 
@@ -86,10 +97,10 @@ def resolve_cli_motion_file() -> str | None:
     return str(motion_path)
 
 
-def resolve_motion_file_from_saved_env_cfg(ckpt_path: str) -> str | None:
+def load_saved_env_yaml(ckpt_path: str) -> tuple[dict | None, pathlib.Path | None]:
     env_yaml_path = pathlib.Path(ckpt_path).resolve().parent / "params" / "env.yaml"
     if not env_yaml_path.is_file():
-        return None
+        return None, None
 
     env_yaml = None
     try:
@@ -98,12 +109,20 @@ def resolve_motion_file_from_saved_env_cfg(ckpt_path: str) -> str | None:
         print(f"[WARN] Failed to parse env.yaml with isaaclab loader: {error}")
         print("[WARN] Falling back to yaml.unsafe_load for legacy python-tagged YAML.")
         try:
-            with env_yaml_path.open("r", encoding="utf-8") as f:
-                env_yaml = yaml.unsafe_load(f)
+            with env_yaml_path.open("r", encoding="utf-8") as file:
+                env_yaml = yaml.unsafe_load(file)
         except Exception as fallback_error:
             print(f"[WARN] yaml.unsafe_load also failed: {fallback_error}")
 
-    if isinstance(env_yaml, dict):
+    return (env_yaml if isinstance(env_yaml, dict) else None), env_yaml_path
+
+
+def resolve_motion_file_from_saved_env_cfg(ckpt_path: str) -> str | None:
+    env_yaml, env_yaml_path = load_saved_env_yaml(ckpt_path)
+    if env_yaml_path is None:
+        return None
+
+    if env_yaml is not None:
         motion_file = env_yaml.get("commands", {}).get("motion", {}).get("motion_file", None)
         if isinstance(motion_file, str) and motion_file:
             motion_path = pathlib.Path(motion_file).expanduser().resolve()
@@ -129,6 +148,37 @@ def resolve_default_motion_file(env_cfg) -> str | None:
         print(f"[INFO] Using motion file from task default config: {motion_path}")
         return str(motion_path)
     return None
+
+
+def resolve_motion_source_from_saved_env_cfg(ckpt_path: str) -> dict[str, object] | None:
+    env_yaml, _ = load_saved_env_yaml(ckpt_path)
+    if env_yaml is None:
+        return None
+
+    source = env_yaml.get("commands", {}).get("motion", {}).get("motion_source", None)
+    if not isinstance(source, dict):
+        return None
+
+    resolved: dict[str, object] = {}
+    supported_keys = ("mode", "single_file", "library_file", "root_dir", "normalize_weights", "default_weight")
+    for key in supported_keys:
+        if key in source:
+            resolved[key] = source[key]
+    return resolved if resolved else None
+
+
+def apply_motion_source_cfg(env_cfg, motion_source_cfg: dict[str, object] | None) -> None:
+    if not motion_source_cfg:
+        return
+
+    target = getattr(getattr(getattr(env_cfg, "commands", None), "motion", None), "motion_source", None)
+    if target is None:
+        return
+
+    for key, value in motion_source_cfg.items():
+        if hasattr(target, key):
+            setattr(target, key, value)
+    print(f"[INFO] Applied motion_source from saved run config: {motion_source_cfg}")
 
 
 def resolve_output_dir(ckpt_path: str) -> str:
@@ -183,6 +233,77 @@ def extract_motion_file_via_text_scan(env_yaml_path: pathlib.Path) -> str | None
     return None
 
 
+def _strip_hydra_prefix_operators(token: str) -> str:
+    body = token
+    while body.startswith("+"):
+        body = body[1:]
+    if body.startswith("~"):
+        body = body[1:]
+    return body
+
+
+def has_cli_obs_pipeline_override() -> bool:
+    for token in raw_hydra_args:
+        body = _strip_hydra_prefix_operators(token)
+        if body.startswith("env.obs_pipeline.") or body.startswith("obs_pipeline."):
+            return True
+    return False
+
+
+def resolve_obs_pipeline_from_saved_env_cfg(ckpt_path: str) -> dict[str, object] | None:
+    env_yaml, env_yaml_path = load_saved_env_yaml(ckpt_path)
+    if env_yaml is None:
+        return None
+
+    obs_pipeline = env_yaml.get("obs_pipeline", None)
+    if not isinstance(obs_pipeline, dict):
+        print(f"[WARN] Saved env config missing obs_pipeline in: {env_yaml_path}")
+        return None
+
+    resolved: dict[str, object] = {}
+    supported_keys = (
+        "mode",
+        "actor_mode",
+        "critic_mode",
+        "include_history",
+        "history_len",
+        "include_future",
+        "future_steps",
+        "future_include_joint_pos",
+        "future_include_joint_vel",
+    )
+
+    for key in supported_keys:
+        if key in obs_pipeline:
+            resolved[key] = obs_pipeline[key]
+
+    if not resolved:
+        return None
+
+    if isinstance(resolved.get("future_steps"), list):
+        resolved["future_steps"] = tuple(resolved["future_steps"])
+    return resolved
+
+
+def apply_obs_pipeline_from_saved_env_cfg_if_needed(env_cfg, ckpt_path: str) -> None:
+    if has_cli_obs_pipeline_override():
+        print("[INFO] Keeping CLI/Hydra-provided obs_pipeline overrides for export.")
+        return
+
+    saved_obs_pipeline = resolve_obs_pipeline_from_saved_env_cfg(ckpt_path)
+    if saved_obs_pipeline is None:
+        return
+
+    for key, value in saved_obs_pipeline.items():
+        if hasattr(env_cfg.obs_pipeline, key):
+            setattr(env_cfg.obs_pipeline, key, value)
+
+    # Normalize and validate (lower-case modes, tuple conversion, constraints).
+    env_cfg.obs_pipeline.__post_init__()
+    apply_observation_pipeline(env_cfg)
+    print(f"[INFO] Applied obs_pipeline from saved run config: {saved_obs_pipeline}")
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Load a checkpoint and export the policy as ONNX."""
@@ -195,12 +316,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.use_saved_obs_pipeline:
+        apply_obs_pipeline_from_saved_env_cfg_if_needed(env_cfg, ckpt_path)
+    else:
+        print("[INFO] Using task/default obs_pipeline (set --use_saved_obs_pipeline to load from saved env.yaml).")
 
     # motion source priority:
     # 1) --motion_file
     # 2) saved run config at <ckpt_dir>/params/env.yaml
     # 3) task default motion_file
-    motion_file = resolve_cli_motion_file()
+    cli_motion_file = resolve_cli_motion_file()
+    motion_file = cli_motion_file
     if motion_file is None:
         motion_file = resolve_motion_file_from_saved_env_cfg(ckpt_path)
     if motion_file is None:
@@ -211,6 +337,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "or ensure <ckpt_dir>/params/env.yaml contains commands.motion.motion_file."
         )
     env_cfg.commands.motion.motion_file = motion_file
+    if cli_motion_file is None:
+        apply_motion_source_cfg(env_cfg, resolve_motion_source_from_saved_env_cfg(ckpt_path))
+    else:
+        print("[INFO] Skipping saved motion_source override because --motion_file was provided.")
 
     output_dir = resolve_output_dir(ckpt_path)
     print(f"[INFO] Loading checkpoint: {ckpt_path}")

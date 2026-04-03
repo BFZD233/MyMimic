@@ -1,0 +1,13 @@
+root_path: /media/raid/workspace/huangyuming/TWIST2/TWIST2_full_npz/
+motions:
+- file: OMOMO_g1_GMR/sub1_clothesstand_000.npz
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_001.npz
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_002.npz
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_003.npz
+  weight: 1.0

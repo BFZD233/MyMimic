@@ -21,14 +21,47 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument(
+    "--play_no_reset",
+    action="store_true",
+    default=False,
+    help="Disable common training-time resets/disturbances for continuous motion playback.",
+)
+parser.add_argument(
+    "--play_free_camera",
+    action="store_true",
+    default=False,
+    help="Use world-anchored camera so manual viewport drag is not pulled back by asset tracking.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+raw_hydra_args = list(hydra_args)
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+
+
+def _rewrite_env_overrides(overrides: list[str]) -> list[str]:
+    rewritten: list[str] = []
+    for token in overrides:
+        prefix = ""
+        body = token
+        while body.startswith("+"):
+            prefix += "+"
+            body = body[1:]
+        if body.startswith("~"):
+            prefix += "~"
+            body = body[1:]
+        if body.startswith("obs_pipeline") and not body.startswith("env.obs_pipeline"):
+            body = "env." + body
+        rewritten.append(prefix + body)
+    return rewritten
+
+
+hydra_args = _rewrite_env_overrides(hydra_args)
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -61,6 +94,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
+from whole_body_tracking.tasks.tracking.obs_pipeline import apply_observation_pipeline
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
@@ -111,6 +145,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     installed_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+    if args_cli.play_no_reset:
+        # Keep playback continuous: remove short episode timeout and typical early-fail reset terms.
+        env_cfg.episode_length_s = float(max(float(getattr(env_cfg, "episode_length_s", 10.0)), 1.0e6))
+        if hasattr(env_cfg, "terminations"):
+            for term_name in ("time_out", "anchor_pos", "anchor_ori", "ee_body_pos"):
+                if hasattr(env_cfg.terminations, term_name):
+                    setattr(env_cfg.terminations, term_name, None)
+        if hasattr(env_cfg, "events") and hasattr(env_cfg.events, "push_robot"):
+            env_cfg.events.push_robot = None
+        print("[INFO] play_no_reset enabled: disabled time_out/anchor terminations and push_robot event.", flush=True)
+
+    if args_cli.play_free_camera:
+        env_cfg.viewer.origin_type = "world"
+        env_cfg.viewer.asset_name = None
+        print("[INFO] play_free_camera enabled: viewer.origin_type=world (no asset-follow snap-back).", flush=True)
+
+    if hasattr(env_cfg, "obs_pipeline"):
+        env_cfg.obs_pipeline.__post_init__()
+        apply_observation_pipeline(env_cfg)
+        policy_group = getattr(getattr(env_cfg, "observations", None), "policy", None)
+        if policy_group is not None:
+            candidate_terms = (
+                "command",
+                "motion_anchor_pos_b",
+                "motion_anchor_ori_b",
+                "base_lin_vel",
+                "base_ang_vel",
+                "joint_pos",
+                "joint_vel",
+                "actions",
+                "twist2_motion",
+                "twist2_proprio",
+                "twist2_future",
+                "twist2_1432_motion",
+                "twist2_1432_proprio",
+                "twist2_1432_future",
+            )
+            active_policy_terms = [name for name in candidate_terms if getattr(policy_group, name, None) is not None]
+            print(
+                "[INFO] Effective obs_pipeline (play): "
+                f"mode={env_cfg.obs_pipeline.mode}, actor_mode={env_cfg.obs_pipeline.resolved_actor_mode()}, "
+                f"critic_mode={env_cfg.obs_pipeline.resolved_critic_mode()}, "
+                f"include_history={env_cfg.obs_pipeline.include_history}, "
+                f"history_len={env_cfg.obs_pipeline.history_len}, "
+                f"include_future={env_cfg.obs_pipeline.include_future}, "
+                f"future_steps={env_cfg.obs_pipeline.future_steps}",
+                flush=True,
+            )
+            print(f"[INFO] Active policy observation terms (play): {active_policy_terms}", flush=True)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -206,16 +290,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
     policy_for_export = ppo_runner.alg.get_policy() if hasattr(ppo_runner.alg, "get_policy") else ppo_runner.alg.policy
-    export_motion_policy_as_onnx(
-        env.unwrapped,
-        policy_for_export,
-        normalizer=getattr(ppo_runner, "obs_normalizer", None),
-        path=export_model_dir,
-        filename="policy.onnx",
-    )
-    attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
-    # reset environment
-    obs, _ = env.get_observations()
+    try:
+        export_motion_policy_as_onnx(
+            env.unwrapped,
+            policy_for_export,
+            normalizer=getattr(ppo_runner, "obs_normalizer", None),
+            path=export_model_dir,
+            filename="policy.onnx",
+        )
+        attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
+    except Exception as exc:
+        # Video playback should still proceed even if export preconditions are not met.
+        print(f"[WARN] Skipping ONNX export during play: {exc}", flush=True)
+    # reset environment (wrapper API may return either obs or (obs, extras))
+    reset_out = env.get_observations()
+    obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -224,7 +313,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            # Wrapper APIs differ across versions: consume first element as observations.
+            step_out = env.step(actions)
+            obs = step_out[0] if isinstance(step_out, tuple) else step_out
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

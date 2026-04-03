@@ -15,11 +15,11 @@ cd "${SCRIPT_DIR}"
 #     Tracking-Flat-G1-v0 \
 #     2
 
-DEFAULT_LOAD_RUN="2026-03-27_02-24-00_20260326-Tracking-Flat-G1-v0"
+DEFAULT_LOAD_RUN="2026-04-02_05-45-59_20260402_twist2_1432outputs"
 DEFAULT_CHECKPOINT="model_20000.pt"
-DEFAULT_MOTION_FILE="/media/raid/workspace/huangyuming/TWIST2/TWIST2_full_npz/AMASS_g1_GMR8/ACCAD_Female1General_c3d_A1_-_Stand_stageii.npz"
+DEFAULT_MOTION_FILE="/media/raid/workspace/huangyuming/TWIST2/TWIST2_full_npz/AMASS_g1_GMR8/ACCAD_Female1Running_c3d_C27_-_crouch_to_run1_stageii.npz"
 DEFAULT_TASK="Tracking-Flat-G1-v0"
-DEFAULT_NUM_ENVS="2"
+DEFAULT_NUM_ENVS="1"
 
 LOAD_RUN="${1:-${DEFAULT_LOAD_RUN}}"
 CHECKPOINT="${2:-${DEFAULT_CHECKPOINT}}"
@@ -30,6 +30,10 @@ NUM_ENVS="${5:-${DEFAULT_NUM_ENVS}}"
 # Optional env overrides.
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-}" # e.g. g1_flat
+USE_TWIST2_1432_OBS="${USE_TWIST2_1432_OBS:-1}" # 1: force TWIST2-compatible 1432-dim actor obs in play
+TWIST2_1432_INCLUDE_FUTURE="${TWIST2_1432_INCLUDE_FUTURE:-1}" # 1: keep future branch (target 1432), 0: disable (1397)
+PLAY_NO_RESET="${PLAY_NO_RESET:-1}" # 1: disable typical training-time resets/disturbances for continuous playback
+PLAY_FREE_CAMERA="${PLAY_FREE_CAMERA:-1}" # 1: world-anchored camera, dragging viewport won't snap back
 
 if [[ ! -f "${MOTION_FILE}" ]]; then
   echo "[ERROR] motion_file not found: ${MOTION_FILE}" >&2
@@ -55,10 +59,41 @@ echo "[INFO] motion_file: ${MOTION_FILE}"
 echo "[INFO] task: ${TASK_NAME}"
 echo "[INFO] num_envs: ${NUM_ENVS}"
 echo "[INFO] cuda_device: ${CUDA_DEVICE}"
+echo "[INFO] play_no_reset: ${PLAY_NO_RESET}"
+echo "[INFO] play_free_camera: ${PLAY_FREE_CAMERA}"
 if [[ -n "${EXPERIMENT_NAME}" ]]; then
   echo "[INFO] experiment_name: ${EXPERIMENT_NAME}"
 fi
 echo "[INFO] livestream: 1 (WebRTC public mode)"
+
+OBS_ARGS=()
+if [[ "${USE_TWIST2_1432_OBS}" == "1" ]]; then
+  if [[ "${TWIST2_1432_INCLUDE_FUTURE}" == "1" ]]; then
+    OBS_ARGS=(
+      obs_pipeline.mode=twist2_1432
+      obs_pipeline.include_history=true
+      obs_pipeline.history_len=10
+      obs_pipeline.include_future=true
+      obs_pipeline.future_steps=[0]
+      obs_pipeline.future_include_joint_pos=true
+      obs_pipeline.future_include_joint_vel=false
+    )
+    echo "[INFO] play obs mode: twist2_1432 (target actor obs dim: 1432)"
+  else
+    OBS_ARGS=(
+      obs_pipeline.mode=twist2_1432
+      obs_pipeline.include_history=true
+      obs_pipeline.history_len=10
+      obs_pipeline.include_future=false
+    )
+    echo "[INFO] play obs mode: twist2_1432 without future (target actor obs dim: 1397)"
+  fi
+else
+  echo "[INFO] play obs mode: default task/saved config"
+fi
+if [[ ${#OBS_ARGS[@]} -gt 0 ]]; then
+  echo "[INFO] OBS overrides: ${OBS_ARGS[*]}"
+fi
 
 CMD=(
   python scripts/rsl_rl/play.py
@@ -70,10 +105,17 @@ CMD=(
   --headless
   --livestream 2
   --kit_args "${KIT_ARGS}"
+  "${OBS_ARGS[@]}"
 )
 
 if [[ -n "${EXPERIMENT_NAME}" ]]; then
   CMD+=(--experiment_name "${EXPERIMENT_NAME}")
+fi
+if [[ "${PLAY_NO_RESET}" == "1" ]]; then
+  CMD+=(--play_no_reset)
+fi
+if [[ "${PLAY_FREE_CAMERA}" == "1" ]]; then
+  CMD+=(--play_free_camera)
 fi
 
 set +e

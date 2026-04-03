@@ -1,0 +1,13 @@
+root_path: /media/raid/workspace/huangyuming/TWIST2/TWIST2_full/
+motions:
+- file: OMOMO_g1_GMR/sub1_clothesstand_000.pkl
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_001.pkl
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_002.pkl
+  weight: 1.0
+  description: general movement
+- file: OMOMO_g1_GMR/sub1_clothesstand_003.pkl
+  weight: 1.0

@@ -1,0 +1,1 @@
+scp -r -p /media/raid/workspace/huangyuming/lzd/whole_body_tracking/logs/rsl_rl/g1_flat/2026-04-02_05-45-59_20260402_twist2_1432outputs/exported/policy.onnx liuzhidan@10.1.123.240:/home/liuzhidan/workspace/humanoid/TWIST2/ckpts/
